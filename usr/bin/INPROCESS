@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+# ========================================================================== #
+#                                                                            #
+#    KVMD-OLED - Bigger OLED daemon for Pi-KVM.                              #
+#                                                                            #
+#    Copyright (C) 2018  Maxim Devaev <mdevaev@gmail.com>                    #
+#                                                                            #
+#    This program is free software: you can redistribute it and/or modify    #
+#    it under the terms of the GNU General Public License as published by    #
+#    the Free Software Foundation, either version 3 of the License, or       #
+#    (at your option) any later version.                                     #
+#                                                                            #
+#    This program is distributed in the hope that it will be useful,         #
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of          #
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           #
+#    GNU General Public License for more details.                            #
+#                                                                            #
+#    You should have received a copy of the GNU General Public License       #
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.  #
+#                                                                            #
+# ========================================================================== #
+### srepac notes --- this is for height=64 oled screen
+# Replace /usr/bin/kvmd-oled.64 with this file after you make a backup just in case
+# In order to make this work on v2, follow the directions below:
+# 1. Add "i2c-dev" without the quotes into /etc/modules-load.d/kvmd.conf file
+# 2. Add "dtparam=i2c_arm=on" without the quotes into /boot/config.txt file
+# 3. Enable kvmd-oled services via "systemctl enable --now kvmd-oled" (applies to both v2/v3)
+# 4. reboot on v2 and watch the magic on your oled screen; no need to reboot v3
+#
+# In order for this to work, edit /etc/systemd/system/multi-user.target.wants/kvmd-oled.service
+# ... and replace the following line:
+# ExecStart=/usr/bin/kvmd-oled --height=32
+# ... with this line:
+# ExecStart=/usr/bin/kvmd-oled.64 --height=64
+#
+# If you had a working kvmd-oled (height 32) and want to use bigger screen, you will need to perform:
+#   systemctl daemon-reload; systemctl restart kvmd-oled
+###
+import sys
+import socket
+import signal
+import itertools
+import logging
+import datetime
+import time
+### srepac changes
+import os
+###
+
+from typing import Tuple
+
+import netifaces
+import psutil
+import usb.core
+
+from luma.core import cmdline as luma_cmdline
+from luma.core.device import device as luma_device
+from luma.core.render import canvas as luma_canvas
+
+from PIL import Image
+from PIL import ImageFont
+
+
+# =====
+_logger = logging.getLogger("oled")
+
+
+def _get_uptime() -> str:
+    uptime = datetime.timedelta(seconds=int(time.time() - psutil.boot_time()))
+    pl = {"days": uptime.days}
+    (pl["hours"], rem) = divmod(uptime.seconds, 3600)
+    (pl["mins"], pl["secs"]) = divmod(rem, 60)
+    return "{days}d {hours}h {mins}m".format(**pl)
+
+
+def _get_temp(fahrenheit: bool) -> str:
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as temp_file:
+            temp = int((temp_file.read().strip())) / 1000
+            if fahrenheit:
+                temp = temp * 9 / 5 + 32
+                return f"{temp:.1f}\u00b0F"
+            return f"{temp:.1f}\u00b0C"
+    except Exception:
+        # _logger.exception("Can't read temp")
+        return "<no-temp>"
+
+
+def _get_cpu() -> str:
+    st = psutil.cpu_times_percent()
+    user = st.user - st.guest
+    nice = st.nice - st.guest_nice
+    idle_all = st.idle + st.iowait
+    system_all = st.system + st.irq + st.softirq
+    virtual = st.guest + st.guest_nice
+    total = max(1, user + nice + system_all + idle_all + st.steal + virtual)
+    percent = int(
+        st.nice / total * 100
+        + st.user / total * 100
+        + system_all / total * 100
+        + (st.steal + st.guest) / total * 100
+    )
+    return f"{percent}%"
+
+
+def _get_mem() -> str:
+    return f"{int(psutil.virtual_memory().percent)}%"
+
+
+# =====
+class Screen:
+    def __init__(
+        self,
+        device: luma_device,
+        font: ImageFont.FreeTypeFont,
+        font_spacing: int,
+        offset: tuple[int, int],
+    ) -> None:
+
+        self.__device = device
+        self.__font = font
+        self.__font_spacing = font_spacing
+        self.__offset = offset
+
+    def draw_text(self, text: str, offset_x: int=0) -> None:
+        with luma_canvas(self.__device) as draw:
+            offset = list(self.__offset)
+            offset[0] += offset_x
+            draw.multiline_text(offset, text, font=self.__font, spacing=self.__font_spacing, fill="white")
+
+    def draw_image(self, image_path: str) -> None:
+        with luma_canvas(self.__device) as draw:
+            draw.bitmap(self.__offset, Image.open(image_path).convert("1"), fill="white")
+
+
+def _detect_geometry() -> dict:
+    with open("/proc/device-tree/model") as file:
+        is_cm4 = ("Compute Module 4" in file.read())
+    has_usb = bool(list(usb.core.find(find_all=True)))
+    if is_cm4 and has_usb:
+        return {"height": 64, "rotate": 2}
+    return {"height": 32, "rotate": 0}
+
+
+
+# =====
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("PIL").setLevel(logging.ERROR)
+
+    parser = luma_cmdline.create_parser(description="Display FQDN and IP on the OLED")
+    parser.set_defaults(**_detect_geometry())
+    parser.add_argument("--font", default="/usr/share/fonts/TTF/ProggySquare.ttf", help="Font path")
+
+    ### srepac change - to make it fit into 3 lines on small oled or 5 lines on big oled -- each row limited to 19 chars
+    parser.add_argument("--font-size", default=15, type=int, help="Font size")
+    parser.add_argument("--font-spacing", default=2, type=int, help="Font line spacing")
+    parser.add_argument("--offset-x", default=0, type=int, help="Horizontal offset")
+    parser.add_argument("--offset-y", default=0, type=int, help="Vertical offset")
+    parser.add_argument("--interval", default=5, type=int, help="Screens interval")
+    parser.add_argument("--image", default="", help="Display some image, wait a single interval and exit")
+    parser.add_argument("--text", default="", help="Display some text, wait a single interval and exit")
+    parser.add_argument("--pipe", action="store_true", help="Read and display lines from stdin until EOF, wait a single interval and exit")
+    parser.add_argument("--clear-on-exit", action="store_true", help="Clear display on exit")
+    parser.add_argument("--contrast", default=64, type=int, help="Set OLED contrast, values from 0 to 255")
+    parser.add_argument("--fahrenheit", action="store_true", help="Display temperature in Fahrenheit instead of Celsius")
+    options = parser.parse_args(sys.argv[1:])
+    if options.config:
+        config = luma_cmdline.load_config(options.config)
+        options = parser.parse_args(config + sys.argv[1:])
+
+    device = luma_cmdline.create_device(options)
+    device.cleanup = (lambda _: None)
+    screen = Screen(
+        device=device,
+        font=ImageFont.truetype(options.font, options.font_size),
+        font_spacing=options.font_spacing,
+        offset=(options.offset_x, options.offset_y),
+    )
+
+    if options.display not in luma_cmdline.get_display_types()["emulator"]:
+        _logger.info("Iface: %s", options.interface)
+    _logger.info("Display: %s", options.display)
+    _logger.info("Size: %dx%d", device.width, device.height)
+    options.contrast = min(max(options.contrast, 0), 255)
+    _logger.info("Contrast: %d", options.contrast)
+    device.contrast(options.contrast)
+
+
+    try:
+        ### srepac changes to show during service start up
+        with canvas(device) as draw:
+            text = f"kvmd-oled.64\nby srepac\n\nInitializing...\n"
+            draw.multiline_text((0, 0), text, font=font, fill="white", align="center")
+        screen = 0
+        ###
+        while True:
+        if options.image:
+            screen.draw_image(options.image)
+            time.sleep(options.interval)
+            with canvas(device) as draw:
+                ### srepac changes to have different screens using modulo division (up to 5 lines per screen)
+                rem = screen % 3
+                if rem == 0:  ### first page is fqdn, model number, image (v2-hdmi, v2-hdmiusb, etc...) + kvmd ver, and date
+                    x = os.popen(" date +\"%D %H:%M %Z\" ")
+                    date = x.read().replace('\n', '')
+                    x = os.popen(" pistat | grep Pi | awk '{print $4, $5, $6, $7, $8, $9}' | sed -e 's/ Model //g' -e 's/  / /g'")
+                    model = x.read().replace('\n', '')
+                    x = os.popen(" pikvm-info | grep kvmd-platform | cut -d'-' -f3,4 ")
+                    img = x.read().replace('\n', '')
+                    x = os.popen(" pikvm-info | grep kvmd$ | awk '{print $1}' ") 
+                    kvmdver = x.read().replace('\n', '')
+                    x = os.popen(" free -m | grep Mem: | awk '{print \"RAM:\", $3 \"/\" $2 \" MB\"}' ")
+                    ram = x.read().replace('\n', '')
+                    # ALTERNATE screen which includes ustreamer version
+                    #text = f"{socket.getfqdn()}\nPi {model}\n{img} v{kvmdver}\nustreamer v{ustreamer}\n{date}"
+                    text = f"{socket.getfqdn()}\nPi {model}\n{img} v{kvmdver}\n{ram}\n{date}"
+
+                elif rem == 1:  ### 2nd page shows both eth/wlan IP, SSID, and cpu/gpu temps
+                    x = os.popen(" pistat | grep temp | cut -d' ' -f 3 ")
+                    temps = x.read().replace('\n', ' ')
+                    connstatus = os.popen(" count=0; ethip=$( ip -o a | grep -v inet6 | egrep 'eth0|br[0-9]|tailscale' | grep -v usb | awk '{print $2, $4}' | cut -d'/' -f1 | sed 's/tailscale/ts/g'|sort ); ssid=$( iwconfig wlan0 | grep SSID | cut -d':' -f2 ) ; if [[ \"$ethip\" == \"\" ]]; then echo \"LAN not connected\"; else printf \"%s %s\n\" $ethip; count=1; fi; if [[ \"$ssid\" == \"\" ]]; then echo \"Wifi not connected\" ; else echo \"SSID $ssid\"; count=1; fi ")
+                    text = f"{temps}\n{connstatus.read()}"
+
+                else:  ### last page shows uptime, load avgs, and sd card usage % and free space
+                    x = os.popen(" for i in `mount | grep mmc | awk '{print $3}' | sort | grep -v boot`; do echo -n `df -h $i | grep -v Filesystem | sort | awk '{print $1, $5, $4}' | sed -e 's+/dev/root+/+g' -e 's+/dev/mmcblk0++g' -e 's+p3+msd+' -e 's+p2+/+' -e 's+p1+/boot+'`' '; mount | grep -w $i | awk '{print $NF}' | awk -F, '{print $1}' | sed 's/(//g'; done ")
+                    sdcard = x.read()
+                    load1, load5, load15 = os.getloadavg()
+                    x = os.popen(" num=$( uptime | awk -F'user' '{print $1}' | awk '{print $NF}' ); if [[ $num -gt 1 || $num -eq 0 ]]; then echo $num users; else echo $num user; fi ")
+                    users = x.read().replace('\n', '')
+                    text = f"{_get_uptime()}, {users}\n{load1}, {load5}, {load15}\n---storage---\n{sdcard}"
+
+                screen += 1
+                draw.multiline_text((0, 0), text, font=font, fill="white")
+                time.sleep(options.interval)
+    except (SystemExit, KeyboardInterrupt):
+        pass
+
+    if options.clear_on_exit:
+        screen.draw_text("")
+
+
+if __name__ == "__main__":
+    main()
