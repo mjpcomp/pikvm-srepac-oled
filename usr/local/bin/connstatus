@@ -1,0 +1,28 @@
+#!/bin/bash
+ethip=$( ip -o a show | grep -v inet6 | awk '{print $2, $4}' | cut -d'/' -f1 | egrep 'br|eth0|ens' )
+if [[ "$ethip" != "" ]]; then 
+	printf "%s %s\n" $ethip
+fi
+
+if [ `ip -br a | grep -c wlan0` -eq 1 ]; then
+	ssid=$( iwconfig wlan0 | grep SSID | cut -d':' -f2 | sed -e 's/"//g' -e 's/ //g' )
+	if [[ "$ssid" == "" || "$ssid" == "off/any" ]]; then
+		AP0=$( iwconfig ap0 2> /dev/null | grep Mode | cut -d':' -f2 | awk '{print $1}' )
+		if [ "$AP0" == "Master" ]; then
+			SSID=$( grep ^ssid= /etc/hostapd/hostapd.conf | cut -d'=' -f2 )
+			PASSPHRASE=$( grep ^wpa_passphrase= /etc/hostapd/hostapd.conf | cut -d'=' -f2 )
+			echo "Hotspot: $SSID"
+			echo "$PASSPHRASE"
+		else
+			echo "Wifi not connected"
+		fi
+	else
+		echo SSID $ssid
+		printf "%s %s\n" $( ip -br a | grep wlan0 | awk '{print $1, $3}' | cut -d'/' -f1 )
+	fi
+fi
+
+tscale=$( ip -br a | grep tailscale | awk '{print $3}' | cut -d'/' -f1 | sed 's/tailscale/ts/g' ) 
+if [[ "$tscale" != "" ]]; then 
+	echo ts0 $tscale
+fi
